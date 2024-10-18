@@ -57,6 +57,7 @@ impl Instance for TIM3 {
             w.cc2e().set_bit().cc2p().clear_bit()
         });
         self.smcr.write(|w| unsafe { w.sms().bits(0b011).sms_3().clear_bit() }); 
+        self.cr2.write(|w| w.mms().variant(0).mms_3().set_bit()); // Enc Clock Output
         self.cr1.write(|w| w.cen().set_bit());
     }
 
