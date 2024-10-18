@@ -158,25 +158,24 @@ Interrupts / Tasks:
         let adc2 = adc::Adc2::new();
 
         // Motor PWM GPIO
-        let mut low_side_a = gpiob.pb3.into_push_pull_output();
-        let mut low_side_b = gpiob.pb0.into_push_pull_output();
-        low_side_a.set_low().unwrap();
-        low_side_b.set_high().unwrap();
+        let low_side_a = gpiob.pb3.into_alternate();
+        let low_side_b = gpiob.pb0.into_alternate();
         let high_side_a = gpiob.pb6.into_alternate();
         let high_side_b = gpiob.pb8.into_alternate();
-        let (mut pwm_a, mut pwm_b) = dp.TIM8.pwm((high_side_a, high_side_b), 30.kHz(), &mut rcc);
+        let (pwm_a, pwm_b) = dp.TIM8.pwm((high_side_a, high_side_b), 30.kHz(), &mut rcc);
+        let mut pwm_a = pwm_a.into_complementary(low_side_a);
+        let mut pwm_b = pwm_b.into_complementary(low_side_b);
         // Enable UEV as trigger
         unsafe { (*hal::stm32::TIM8::ptr()).cr2.write(|w| w.mms2().bits(2)) };
-        pwm_a.set_duty(0);
+        unsafe { (*hal::stm32::TIM8::ptr()).bdtr.write(|w| w.dtg().variant(16)) } // 16 * 125ns dead-time
+        pwm_a.set_duty(pwm_a.get_max_duty() / 3);
         pwm_a.enable();
-        pwm_b.set_duty(0);
+        pwm_b.set_duty(pwm_b.get_max_duty() / 10);
         pwm_b.enable();
 
         let mut motor = motor::Motor {
             pwm_fwd: pwm_a,
             pwm_rev: pwm_b,
-            fwd_en: low_side_b,
-            rev_en: low_side_a,
             forward: true,
         };
 
@@ -355,7 +354,7 @@ Interrupts / Tasks:
         let mut ctrl = ctx.shared.control;
         ctrl.lock(|ctrl| {
             let duty_cycle = ctrl.torque.control_cycle(sample);
-            motor.set_duty_cycle(duty_cycle);
+            //motor.set_duty_cycle(duty_cycle);
         });
 
         led2.toggle().unwrap();
