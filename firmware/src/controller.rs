@@ -1,8 +1,6 @@
-use pid::Pid;
-use stm32g4xx_hal::stm32::{RCC, TIM2, TIM15};
-use embedded_hal::PwmPin;
-
-use crate::adc;
+use pid::{ControlOutput, Pid};
+use stm32g4xx_hal::stm32::{RCC, TIM2, TIM3, TIM15};
+use micromath::F32Ext;
 
 pub struct Controller {
     pub torque: Torque,
@@ -33,8 +31,8 @@ pub struct Torque {
 impl Torque {
     pub fn new () -> Self {
         let mut pid = Pid::new(0.0, 0.9999);
-        pid.p(1.00, 1.000);
-        pid.i(0.10, 0.2);
+        pid.p(0.05, 1.000);
+        pid.i(0.001, 0.5);
         //pid.d(0.5, 0.4);
 
         Torque {
@@ -60,7 +58,7 @@ impl Torque {
     }
 
     pub fn control_cycle(&mut self, sample: u16) -> f32 {
-        self.current = 0.95 * self.current + 0.05 * Torque::sample_to_motor_current(sample);
+        self.current = 0.7 * self.current + 0.3 * Torque::sample_to_motor_current(sample);
         self.duty_cycle = self.next_output(self.current);
 
         if self.enabled {
@@ -72,19 +70,22 @@ impl Torque {
 
     // Input 0 - 4095, 0A at 2047
     // 3.3V / 4095counts
-    // 0.015 V/A * 20 V/V = 0.3 V/A
+    // 0.004 V/A * 20 V/V = 0.08 V/A
     pub fn sample_to_motor_current(sample: u16) -> f32 {
         let centered_sample = (sample as i32) - 2047;
         let volts = (centered_sample as f32) * 3.3 / 4095.0;
 
-        volts / 0.3
+        volts / 0.08
     }
 }
 
 
 pub struct Speed {
     pub rpm: f32,
+    pub target_rpm: f32,
     pub command_torque: f32,
+    pub last_position: u32,
+    pub last_out: ControlOutput<f32>,
     pub pid: Pid<f32>,
 }
 
@@ -92,22 +93,32 @@ impl Speed {
     pub fn init() -> Self {
         Speed::init_timer();
 
-        let mut pid = Pid::new(0.0, 3.0);
-        pid.p(0.1, 3.0);
-        pid.i(0.01, 0.5);
+        let mut pid = Pid::new(0.0, 12.0);
+        pid.p(0.10, 12.0);
+        pid.i(0.00010, 5.0);
+        pid.d(0.4, 3.0);
 
         Speed {
             rpm: 0.0,
+            target_rpm: 0.0,
             command_torque: 0.0,
+            last_position: 0,
+            last_out: ControlOutput{p: 0.0, i: 0.0, d: 0.0, output: 0.0},
             pid
         }
     }
 
     pub fn control_cycle(&mut self) -> f32 {
-        self.rpm = self.get_rpm();
+        let rpm = self.get_rpm();
+        if rpm < 1500.0 {
+            self.rpm = 0.98 * self.rpm + 0.02 * rpm;
+        }
+        let feed_forward = self.target_rpm.powf(0.21);
+
         let control = self.pid.next_control_output(self.rpm);
 
-        self.command_torque = control.output.max(0.0);
+        self.command_torque = (feed_forward + control.output).max(0.0);
+        self.last_out = control;
 
         self.command_torque
     }
@@ -118,6 +129,7 @@ impl Speed {
     }
 
     pub fn set_target(&mut self, target: f32) {
+        self.target_rpm = target;
         self.pid.setpoint(target);
     }
 
@@ -148,15 +160,22 @@ impl Speed {
 
     }
 
-    pub fn get_rpm(&self) -> f32 {
-        let tim = unsafe { &(*TIM2::ptr())};
+    pub fn get_rpm(&mut self) -> f32 {
+        let tim2 = unsafe { &(*TIM2::ptr())};
+        let tim3 = unsafe { &(*TIM3::ptr())};
 
-        let mut speed = tim.ccr1().read().ccr().bits();
+        let pos = tim3.cnt.read().cnt().bits() as u32;
+        let mut speed = tim2.ccr1().read().ccr().bits();
 
         // Avoid div by zero if stopped.
         if speed == 0 {
             return 0.0;
         }
+
+        if pos == self.last_position {
+            return 0.0;
+        }
+        self.last_position = pos;
 
         128.0 * 60.0e6 / (3200.0 * (speed as f32))
     }

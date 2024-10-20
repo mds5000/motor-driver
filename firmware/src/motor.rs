@@ -1,9 +1,10 @@
-use stm32g4xx_hal::{pwm::{ActiveHigh, ComplementaryEnabled, Pwm, C1, C2}, stm32::TIM8};
+use stm32g4xx_hal::{pwm::{ActiveHigh, ComplementaryDisabled, ComplementaryEnabled, Pwm, C1, C2}, stm32::TIM8};
 use stm32g4xx_hal::gpio::{gpiob, Output, PushPull};
 use stm32g4xx_hal::prelude::OutputPin;
 use embedded_hal::PwmPin;
 
 type PwmPins<C> = Pwm<TIM8, C, ComplementaryEnabled, ActiveHigh, ActiveHigh>;
+//type PwmPins<C> = Pwm<TIM8, C, ComplementaryDisabled, ActiveHigh, ActiveHigh>;
 
 pub struct Motor {
     pub pwm_fwd: PwmPins<C1>,
