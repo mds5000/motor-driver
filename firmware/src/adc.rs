@@ -104,8 +104,8 @@ impl Adc2 {
 
         // Configure Sequencer, number of conversions
         adc.sqr1.write(|w| unsafe {
-            w.l().bits(1)    // Two Conversion
-             .sq1().bits(2)  // Channel 2
+            w.l().bits(0)    // One Conversion
+             //.sq1().bits(2)  // Channel 2
              .sq2().bits(13)        // Channel 13
         });
 

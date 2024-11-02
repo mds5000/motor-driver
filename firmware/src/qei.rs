@@ -1,3 +1,5 @@
+use core::u16;
+
 use embedded_hal;
 use stm32g4xx_hal;
 use stm32g4xx_hal::rcc;
@@ -8,6 +10,8 @@ pub struct Qei<TIM, PINA, PINB> {
     pin_a: PINA,
     pin_b: PINB,
 }
+
+unsafe impl<TIM, PINA, PINB> Send for Qei<TIM, PINA, PINB> {}
 
 impl<TIM: Instance, PINA, PINB> Qei<TIM, PINA, PINB> {
     pub fn new(mut tim: TIM, pin_a: PINA, pin_b: PINB) -> Self {
@@ -62,10 +66,12 @@ impl Instance for TIM3 {
     }
 
     fn read_direction(&self) -> bool {
-        self.cr1.read().dir().bit_is_clear()
+        // Output is inverted since encoder is backwards
+        self.cr1.read().dir().bit_is_set()
     }
 
     fn read_count(&self) -> u16 {
-        self.cnt.read().cnt().bits() 
+        // Output is inverted since encoder is backwards
+        u16::MAX - self.cnt.read().cnt().bits() 
     }
 }

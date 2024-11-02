@@ -9,22 +9,23 @@ mod qei;
 mod adc;
 mod controller;
 mod motor;
+mod message;
 
 #[rtic::app(device = stm32g4xx_hal::stm32, peripherals = true, dispatchers = [USART1, USART2])]
 mod app{
     use super::*;
 
-    use core::fmt::Write;
-    use cortex_m::register::control;
-    use qei::Qei;
+    use core::ascii::escape_default;
+    use core::fmt;
+    use message::Message;
     use rtic_monotonics::systick_monotonic;
     use rtic_sync::channel::Receiver;
-    use shared_resources::usb_serial_that_needs_to_be_locked;
-    use stm32g4xx_hal::pwm::PwmAdvExt;
+    use stm32g4xx_hal::comparator::EnabledState;
+    use stm32g4xx_hal::pwm::{FaultMonitor, Polarity, PwmAdvExt};
     use stm32g4xx_hal as hal;
     use hal::prelude::*;
     use hal::time::{RateExtU32, ExtU32};
-    use stm32g4xx_hal::gpio::{Alternate, AlternateOD, Input, Output, PullUp, PushPull, AF14, AF15, AF2, AF8};
+    use stm32g4xx_hal::gpio::{Alternate, AlternateOD, ExtiPin, Input, Output, PullUp, PushPull, AF14, AF15, AF2, AF8};
     use stm32g4xx_hal::i2c::{self, I2c};
     use stm32g4xx_hal::rcc::{Config, PllConfig, PllMDiv, PllNMul, PllRDiv};
     use stm32g4xx_hal::stm32::{I2C3, TIM3};
@@ -37,8 +38,9 @@ mod app{
     use usb_device::bus::UsbBusAllocator;
     use usb_device::device::UsbDevice;
     use usb_device::prelude::*;
+    use usbd_serial::embedded_io::Write;
     use usbd_serial::{SerialPort, USB_CLASS_CDC};
-    use rotary_encoder_hal::{Direction, Rotary};
+    use rotary_encoder_hal::Rotary;
     use sh1106::{prelude::*, Builder};
     use embedded_graphics::prelude::*;
     use embedded_graphics::pixelcolor::BinaryColor;
@@ -51,7 +53,7 @@ mod app{
     use embedded_graphics::text::Text;
     use heapless::{String, Vec};
 
-    use defmt::{info, error};
+    use defmt::info;
 
     type UsbBusType = UsbBus<Peripheral<PA11<Alternate<AF14>>, PA12<Alternate<AF14>>>>;
     systick_monotonic!(Mono, 1_000);
@@ -62,7 +64,8 @@ mod app{
         usb_serial: SerialPort<'static, UsbBus<Peripheral<PA11<Alternate<AF14>>, PA12<Alternate<AF14>>>>>,
     }
 
-    const QUEUE_DEPTH: usize = 8;
+    const QUEUE_DEPTH: usize = 4;
+    const TELEM_DEPTH: usize = 32;
     #[local]
     struct Local {
         adc1: adc::Adc1,
@@ -70,12 +73,11 @@ mod app{
         led1: PF0<Output<PushPull>>,
         led2: PF1<Output<PushPull>>,
         motor: motor::Motor,
-        motor_on: PA10<Input<PullUp>>,
-        disp: GraphicsMode<I2cInterface<I2c<I2C3, PB5<AlternateOD<AF8>>, PA8<AlternateOD<AF2>>>>>,
-        motor_enc: Qei<TIM3, PB4<Alternate<AF2>>, PA7<Alternate<AF2>>>,
         usb_dev: UsbDevice<'static, UsbBus<Peripheral<PA11<Alternate<AF14>>, PA12<Alternate<AF14>>>>>,
-        msg_tx: Sender<'static, Vec<u8, 16>, QUEUE_DEPTH>,
-        msg_rx: Receiver<'static, Vec<u8, 16>, QUEUE_DEPTH>,
+        msg_tx: Sender<'static, [u8; 32], QUEUE_DEPTH>,
+        msg_rx: Receiver<'static, [u8; 32], QUEUE_DEPTH>,
+        telem_tx: Sender<'static, [u8; 32], TELEM_DEPTH>,
+        telem_rx: Receiver<'static, [u8; 32], TELEM_DEPTH>,
     }
 
 /*
@@ -92,12 +94,12 @@ I/O:
     A2 - ENC_A      
     A3 - ENC_B      
     A4 - ENC_BTN
-    A5 - SPEED      (ADC2.AIN14)
+    A5 - ESTOP      (ADC2.AIN14)
     A6 - STEP       (TIM16.1, AF1)
     A7 - PHASE_B    (TIM3.2, AF2)
     A8 - DISP_CLK   (I2C3)
     A9 - DIR
-    A10 - ON_SW
+    A10 - ON_SW     (TIM8_BKIN)
     A11 - USB_N     (USB)
     A12 - USB_P     (USB)
     A13 - SWDIO/BTN_ENT
@@ -155,7 +157,7 @@ Interrupts / Tasks:
         // ADC, must happen before PWM is enabled
         let _isns = gpioa.pa0.into_analog();
         let _vsns = gpioa.pa1.into_analog();
-        let _speed = gpioa.pa5.into_analog();
+        //let _speed = gpioa.pa5.into_analog();
         let adc1 = adc::Adc1::new();
         let adc2 = adc::Adc2::new();
 
@@ -164,11 +166,13 @@ Interrupts / Tasks:
         let low_side_b = gpiob.pb0.into_alternate();
         let high_side_a = gpiob.pb6.into_alternate();
         let high_side_b = gpiob.pb8.into_alternate();
+        let e_stop = gpioa.pa10.into_alternate();
         //let (mut pwm_a, mut pwm_b) = dp.TIM8.pwm((high_side_a, high_side_b), 30.kHz(), &mut rcc);
-        let (_, (pwm_a, pwm_b)) = dp.TIM8.pwm_advanced(
+        let (fault, (pwm_a, pwm_b)) = dp.TIM8.pwm_advanced(
             (high_side_a, high_side_b), &mut rcc)
             .frequency(30.kHz())
             .with_deadtime(500.nanos())
+            .with_break_pin(e_stop, Polarity::ActiveLow)
             .finalize();
         let mut pwm_a = pwm_a.into_complementary(low_side_a);
         let mut pwm_b = pwm_b.into_complementary(low_side_b);
@@ -182,8 +186,12 @@ Interrupts / Tasks:
         let mut motor = motor::Motor {
             pwm_fwd: pwm_a,
             pwm_rev: pwm_b,
-            forward: true,
         };
+
+        // End-stops
+        let mut endstop = gpioa.pa5.into_pull_up_input();
+        endstop.make_interrupt_source(syscfg);
+        endstop.enable_interrupt(exti);
 
         // LED
         let mut led1 = gpiof.pf0.into_push_pull_output();
@@ -192,7 +200,6 @@ Interrupts / Tasks:
         led2.set_low().unwrap();
 
         // GPIO
-        let mut motor_on = gpioa.pa10.into_pull_up_input();
         let mut fan_en = gpiob.pb7.into_push_pull_output();
         fan_en.set_low().unwrap();
 
@@ -221,28 +228,13 @@ Interrupts / Tasks:
         let enc_b: PA7<Alternate<AF2>> = gpioa.pa7.into_alternate(); // AF2 TIM3.2
         let motor_enc = qei::Qei::new(dp.TIM3, enc_a, enc_b);
 
-        // Display Encoder
-        let mut dea = gpioa.pa2.into_pull_up_input();
-        let mut deb = gpioa.pa3.into_pull_up_input();
-        let mut disp_enc_btn = gpioa.pa4.into_pull_up_input();
-        let mut disp_enc = Rotary::new(dea, deb);
-
-        // Display
-        cortex_m::asm::delay(20000000);
-        led2.set_high().unwrap();
-        let scl = gpioa.pa8.into_alternate_open_drain();
-        let sda = gpiob.pb5.into_alternate_open_drain();
-        let i2c = dp.I2C3.i2c(sda, scl, i2c::Config::new(100.kHz()), &mut rcc);
-        let mut disp: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
-        disp.init().unwrap(); // TODO: Handle no-display
-        disp.flush().unwrap();
-
-        let mut control = controller::Controller::new();
+        let mut control = controller::Controller::new(motor_enc, fault, endstop);
         control.torque.set_target(0.000);
         control.speed.set_target(00.0);
         control.torque.enabled = false;
 
-        let (s, r) = make_channel!(Vec<u8, 16>, QUEUE_DEPTH);
+        let (s, r) = make_channel!([u8; 32], QUEUE_DEPTH);
+        let (ts, tr) = make_channel!([u8; 32], TELEM_DEPTH);
 
         // Enable Interrupts
         unsafe {
@@ -251,10 +243,9 @@ Interrupts / Tasks:
             cortex_m::peripheral::NVIC::unmask(hal::interrupt::USB_LP);
         }
 
-        //usb_task::spawn().unwrap();
+        cmd_task::spawn().unwrap();
+        telem_task::spawn().unwrap();
         display_task::spawn().unwrap();
-
-        info!("starting main loop.");
 
         (
             Shared {
@@ -267,121 +258,155 @@ Interrupts / Tasks:
                 led1,
                 led2,
                 motor,
-                motor_on,
-                disp,
-                motor_enc,
                 usb_dev,
                 msg_rx: r,
                 msg_tx: s,
+                telem_rx: tr,
+                telem_tx: ts,
             }
         )
     }
 
-    #[task(priority = 1, local = [adc2, motor_on, led2, disp, msg_rx], shared = [control])]
-    async fn display_task(mut ctx: display_task::Context) {
-        info!("starting disp loop.");
-        let adc = ctx.local.adc2;
-        let enable = ctx.local.motor_on;
+    #[task(priority = 2, local = [msg_rx], shared = [control])]
+    async fn cmd_task(mut ctx: cmd_task::Context) {
+        info!("starting cmd loop.");
         let mut control = ctx.shared.control;
-        let disp = ctx.local.disp;
-        let led2 = ctx.local.led2;
-        let style = MonoTextStyleBuilder::new()
-            .font(&FONT_6X12)
-            .text_color(BinaryColor::On)
-            .build();
-        disp.flush().unwrap();
-
-        let mut i = 0;
-        let mut disp_str: String<32> = String::new();
-
         let msg_rx = ctx.local.msg_rx;
 
         loop {
-            adc.start_conversion();
-            disp.clear();
-            let voltage = adc::Adc2::sample_to_input_voltage(adc.read_sample());
+            if let Ok(bytes) = msg_rx.recv().await {
+                control.lock(|control| {
+                    match Message::from_bytes(&bytes) {
+                        Some(Message::SetSpeed(speed)) => {
+                            let speed = clamp(speed, -1000.0, 1000.0);
+                            control.speed.set_target(speed);
+                            info!("Set Speed {}", speed);
+                        },
+                        Some(Message::SetPosition(pos)) => {
+                            let pos = clamp(pos, -10000, 10000);
+                            control.position.set_target(pos);
+                            info!("Set Position {}", pos);
+                        },
+                        Some(Message::Enable(en)) => {
+                            control.torque.enabled = en;
+                            info!("Enable {}", en);
+                        },
+                        _ => {}
+                    }
+                });
+            }
+        }
+    }
 
-            adc.start_conversion();
-            let potentiometer = adc::Adc2::sample_to_volts(adc.read_sample());
+    #[task(priority = 1, local = [telem_rx], shared = [usb_serial, control])]
+    async fn telem_task(mut ctx: telem_task::Context) {
+        info!("starting telem loop.");
+        let mut control = ctx.shared.control;
+        let mut serial = ctx.shared.usb_serial;
+        let telem_rx = ctx.local.telem_rx;
 
-            disp_str.clear();
-            write!(disp_str, "IN: {:2.2}V, {:.1}V", voltage, potentiometer).unwrap();
-            Text::new(&disp_str, Point::new(0,10), style).draw(disp).unwrap();
+        let mut enabled = false;
+        loop {
+            control.lock(|ctrl| enabled = ctrl.torque.enabled);
 
-
-
-            let mut amps = 0.0;
-            let mut duty_cycle = 0.0;
-            let mut speed = 0.0;
-            let mut cmd = 0.0;
-
-            led2.set_low().unwrap();
-            control.lock(|control| {
-                amps = control.torque.current;
-                duty_cycle = control.torque.duty_cycle;
-                speed = control.speed.rpm;
-                cmd = control.speed.command_torque;
-
-                //control.speed.set_target(potentiometer * 300.0);
-                //control.torque.enabled = enable.is_high().unwrap();
-                if let Ok(v) = msg_rx.try_recv() {
-                    control.torque.enabled = true;
-                    control.speed.set_target(50.0);
+            if let Ok(msg) = telem_rx.recv().await {
+                if enabled {
+                    serial.lock(|serial| {
+                        //if serial.rts() {
+                            serial.write_all(&msg);
+                        //}
+                    });
                 }
-            });
+            }
+        }
+    }
+
+    #[task(priority = 1, local = [led2], shared = [control])]
+    async fn display_task(mut ctx: display_task::Context) {
+        info!("starting disp loop.");
+        //let adc = ctx.local.adc2;
+        let mut control = ctx.shared.control;
+        let led2 = ctx.local.led2;
+
+        let mut i = 0;
+
+        loop {
+            //adc.start_conversion();
+            //let voltage = adc::Adc2::sample_to_input_voltage(adc.read_sample());
+
+            //adc.start_conversion();
+            //let potentiometer = adc::Adc2::sample_to_volts(adc.read_sample());
+            //control.lock(|ctrl| ctrl.position.update_abs_position(potentiometer));
+
             led2.set_high().unwrap();
-
-            disp_str.clear();
-            write!(disp_str, "S: {:.1}r, {:1.3}A", speed, cmd).unwrap();
-            Text::new(&disp_str, Point::new(0,40), style).draw(disp).unwrap();
-
-            disp_str.clear();
-            write!(disp_str, "I: {:1.3}A, {:2.1}%", amps, duty_cycle * 100.0).unwrap();
-            Text::new(&disp_str, Point::new(0,25), style).draw(disp).unwrap();
-
-
-            disp.flush().unwrap();
-            Mono::delay(10.millis()).await;
-            Mono::delay(90.millis()).await;
+            Mono::delay(400.millis()).await;
+            led2.set_low().unwrap();
+            Mono::delay(100.millis()).await;
 
             i += 1;
         }
     }
 
 
-    #[task(binds = TIM1_BRK_TIM15, priority=4, local = [led1], shared = [control, usb_serial])]
+    #[task(binds = TIM1_BRK_TIM15, priority=4, local = [adc2, led1, telem_tx], shared = [control, usb_serial])]
     fn timer_interrupt(mut ctx: timer_interrupt::Context) {
         controller::Speed::clear_timer();
 
-        let led2 = ctx.local.led1;
-        led2.set_low().unwrap();
+        let adc = ctx.local.adc2;
+        adc.start_conversion();
 
-        let mut buffer = [0u8; 22];
-        buffer[0] = b'z';
-        buffer[21] = b'\n';
+        let led1 = ctx.local.led1;
 
+        //led2.set_low().unwrap();
+
+        let tlm_tx = ctx.local.telem_tx;
         let mut ctrl = ctx.shared.control;
-        let mut enabled = false;
+
+        let potentiometer = adc::Adc2::sample_to_volts(adc.read_sample());
         ctrl.lock(|ctrl| {
+            let now = Mono::now();
             let torque = ctrl.speed.control_cycle();
             ctrl.torque.set_target(torque);
-            enabled = ctrl.torque.enabled;
 
-            buffer[1..5].copy_from_slice(&ctrl.speed.command_torque.to_be_bytes());
-            buffer[5..9].copy_from_slice(&ctrl.speed.last_out.p.to_be_bytes());
-            buffer[9..13].copy_from_slice(&ctrl.speed.last_out.i.to_be_bytes());
-            buffer[13..17].copy_from_slice(&ctrl.speed.last_out.d.to_be_bytes());
-            buffer[17..21].copy_from_slice(&ctrl.speed.rpm.to_be_bytes());
+            let output = !ctrl.fault.is_fault_active();
+            led1.set_state(output.into());
+
+            let mut buffer = [0u8; 32];
+
+            buffer[0] = b'z';
+            buffer[1..5].copy_from_slice(&now.ticks().to_be_bytes());
+            buffer[5..9].copy_from_slice(&ctrl.torque.current.to_be_bytes());
+            buffer[9..13].copy_from_slice(&ctrl.speed.command_torque.to_be_bytes());
+            buffer[13..17].copy_from_slice(&ctrl.speed.last_out.p.to_be_bytes());
+            buffer[17..21].copy_from_slice(&ctrl.speed.last_out.i.to_be_bytes());
+            buffer[21..25].copy_from_slice(&ctrl.speed.last_out.d.to_be_bytes());
+            buffer[25..29].copy_from_slice(&ctrl.speed.rpm.to_be_bytes());
+            buffer[29] = b'\n';
+            tlm_tx.try_send(buffer);
+
+            ctrl.position.cycle += 1;
+            if ctrl.position.cycle == 10 {
+                ctrl.position.cycle = 0;
+
+                let position = ctrl.speed.last_position;
+                let speed = ctrl.position.control_cycle(position as i32);
+                ctrl.speed.set_target(speed);
+
+                buffer[0] = b'p';
+                buffer[1..5].copy_from_slice(&now.ticks().to_be_bytes());
+                buffer[5..9].copy_from_slice(&ctrl.position.last_out.output.to_be_bytes());
+                buffer[9..13].copy_from_slice(&ctrl.position.last_out.p.to_be_bytes());
+                buffer[13..17].copy_from_slice(&ctrl.position.last_out.i.to_be_bytes());
+                //buffer[17..21].copy_from_slice(&ctrl.position.last_out.d.to_be_bytes());
+                buffer[17..21].copy_from_slice(&ctrl.position.abs_pos.to_be_bytes());
+                buffer[21..25].copy_from_slice(&ctrl.position.pid.setpoint.to_be_bytes());
+                buffer[25..29].copy_from_slice(&ctrl.speed.last_position.to_be_bytes());
+                buffer[29] = b'\n';
+                tlm_tx.try_send(buffer);
+            }
+
+            ctrl.position.update_abs_position(potentiometer);
         });
-
-        let mut usb_serial = ctx.shared.usb_serial;
-        if enabled {
-            usb_serial.lock(|usb| {
-                usb.write(&buffer);
-            });
-        }
-
-        led2.set_high().unwrap();
     }
 
     #[task(binds = ADC1_2, priority=5, shared = [control], local = [motor, adc1])]
@@ -406,18 +431,24 @@ Interrupts / Tasks:
 
         serial.lock(|serial| {
             if usb_dev.poll(&mut [serial])  {
-
-                let mut data    = Vec::new();
+                let mut data = [0u8; 32];
                 match serial.read(&mut data) {
                     Ok(n) => {
                         _ = msg_tx.try_send(data)
-
                     }
-                    Err(_) => {}
+                    _ => { }
                 }
-                //info!("USB");
             }
         });
+    }
+
+
+    fn clamp<T: PartialOrd>(v :T, min: T, max: T) -> T {
+        match v {
+            v if v < min => min,
+            v if v > max => max,
+            _ => v
+        }
     }
 
 
