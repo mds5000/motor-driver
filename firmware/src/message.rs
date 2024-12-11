@@ -5,6 +5,7 @@ pub enum Message {
     SetPosition(i32),
     SetPID(u8, f32, f32, f32),
     Enable(bool),
+    Home,
 }
 
 
@@ -45,6 +46,13 @@ impl Message {
                 let en = bytes[1] != 0;
                 if bytes[2] == b'e' {
                     Some(Message::Enable(en))
+                } else {
+                    None
+                }
+            }
+            b'h' => {
+                if bytes[1] == 1 && bytes[2] == b'h' {
+                    Some(Message::Home)
                 } else {
                     None
                 }

@@ -1,3 +1,4 @@
+use defmt::warn;
 use embedded_hal::Qei;
 use embedded_hal::Direction;
 use pid::{ControlOutput, Pid};
@@ -13,7 +14,17 @@ use crate::qei;
 
 type QeiEnc = qei::Qei<TIM3, PB4<Alternate<AF2>>, PA7<Alternate<AF2>>>;
 
+#[derive(PartialEq, Debug)]
+pub enum CtrlState {
+    Reset,
+    Homing,
+    Homed(i32),
+    Enabled,
+
+}
+
 pub struct Controller {
+    pub state: CtrlState,
     pub torque: Torque,
     pub speed: Speed,
     pub position: Position,
@@ -24,6 +35,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(enc: QeiEnc, fault: pwm::PwmControl<TIM8, pwm::FaultEnabled>, endstop: gpioa::PA5<Input<PullUp>>) -> Self {
         Controller {
+            state: CtrlState::Reset,
             torque: Torque::new(),
             speed: Speed::init(enc),
             position: Position::init(),
@@ -31,6 +43,46 @@ impl Controller {
             endstop,
         }
     }
+
+    pub fn set_speed(&mut self, velocity: f32) {
+        let velocity = velocity.clamp(-1000.0, 1000.0);
+        self.speed.set_target(velocity);
+    }
+
+    pub fn set_position(&mut self, position: i32) {
+        if let CtrlState::Homed(home_pos) = self.state {
+            let zero_position: i32 = 12500;
+            let pos = home_pos +  zero_position + position.clamp(-13000, 13000);
+            self.position.set_target(pos);
+        } else {
+            warn!("Not homed.")
+        }
+    }
+
+    pub fn start_homing(&mut self) {
+        if self.state != CtrlState::Reset {
+            warn!("Not in reset.");
+            return;
+        }
+
+        self.state = CtrlState::Homing;
+        self.torque.enabled = true;
+        self.position.set_max_speed(20.0);
+        self.position.set_target(-100000);
+    }
+
+    pub fn set_home_position(&mut self) -> i32 {
+        let home_position = self.speed.get_position();
+        self.state = CtrlState::Homed(home_position);
+
+        home_position
+    }
+
+    pub fn shutdown(&mut self) {
+        self.torque.enabled = false;
+        self.state = CtrlState::Reset;
+    }
+
 }
 
 pub struct Torque {
@@ -132,7 +184,8 @@ impl Speed {
             self.rpm = self.filter.run(rpm);
         }
         
-
+        // Feed forward term was derived from current vs torque testing done on the motor
+        // About 1 Amp is necessary just to overcome the internal friction of the motor.
         let feed_forward = self.target_rpm.abs().powf(0.21).copysign(self.target_rpm);
         let control = self.pid.next_control_output(self.rpm);
         self.command_torque = (feed_forward + control.output);
@@ -158,13 +211,11 @@ impl Speed {
         // SETUP TIMER 15
         rcc.apb2enr.modify(|_, w| w.tim15en().set_bit());
 
-
         tim.psc.write(|w| w.psc().variant(128)); // Div by 128 -> 1MHz
         tim.arr.write(|w| w.arr().variant(1000)); // Count to 1000 -> 1KHz
         tim.dier.write(|w| w.uie().set_bit());
         tim.cr1.write(|w| w.arpe().set_bit()
                                    .cen().set_bit());
-
 
         // SETUP TIMER 2
         rcc.apb1enr1.modify(|_, w| w.tim2en().set_bit());
@@ -175,7 +226,6 @@ impl Speed {
         tim.smcr.modify(|_, w| w.sms().variant(0b000).sms_3().set_bit()); // Reset on trigger
         tim.ccer.write(|w| w.cc1e().set_bit()); // Enable capture on CC1
         tim.cr1.write(|w| w.cen().set_bit()); // Enable timer.
-
     }
 
     pub fn get_rpm(&mut self) -> f32 {
@@ -202,15 +252,18 @@ impl Speed {
 
         128.0 * 60.0e6 / (3200.0 * (speed as f32))
     }
+
+    pub fn get_position(&self) -> i32 {
+        self.last_position
+    }
+
 }
 
 
 pub struct Position {
     pub cycle: u32,
-    pub zero_pos: i32,
     pub last_out: ControlOutput<f32>,
     pub pid: Pid<f32>,
-    pub abs_pos: f32,
 }
 
 impl Position {
@@ -221,33 +274,22 @@ impl Position {
 
         Position {
             cycle: 0,
-            zero_pos: 0,
             last_out: ControlOutput{p: 0.0, i: 0.0, d: 0.0, output: 0.0},
             pid,
-            abs_pos: 0.0,
         }
     }
 
     pub fn control_cycle(&mut self, position: i32) -> f32 {
-        let pos = position - self.zero_pos;
-        self.last_out = self.pid.next_control_output(pos as f32);
+        self.last_out = self.pid.next_control_output(position as f32);
 
         self.last_out.output
+    }
+
+    pub fn set_max_speed(&mut self, speed: f32) {
+        self.pid.output_limit = speed;
     }
 
     pub fn set_target(&mut self, target: i32) {
         self.pid.setpoint(target as f32);
     }
-
-    pub fn set_zero_position(&mut self, pos: i32) {
-        self.zero_pos = pos
-    }
-
-    pub fn update_abs_position(&mut self, sample: f32) -> f32 {
-        self.abs_pos = self.abs_pos * 0.9 + sample * 0.1;
-
-        self.abs_pos
-    }
-
-
 }

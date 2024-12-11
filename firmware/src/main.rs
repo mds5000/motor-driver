@@ -17,11 +17,13 @@ mod app{
 
     use core::ascii::escape_default;
     use core::fmt;
+    use controller::CtrlState;
     use message::Message;
     use rtic_monotonics::systick_monotonic;
     use rtic_sync::channel::Receiver;
     use stm32g4xx_hal::comparator::EnabledState;
     use stm32g4xx_hal::pwm::{FaultMonitor, Polarity, PwmAdvExt};
+    use stm32g4xx_hal::syscfg::SysCfgExt;
     use stm32g4xx_hal as hal;
     use hal::prelude::*;
     use hal::time::{RateExtU32, ExtU32};
@@ -53,7 +55,7 @@ mod app{
     use embedded_graphics::text::Text;
     use heapless::{String, Vec};
 
-    use defmt::info;
+    use defmt::{info, warn};
 
     type UsbBusType = UsbBus<Peripheral<PA11<Alternate<AF14>>, PA12<Alternate<AF14>>>>;
     systick_monotonic!(Mono, 1_000);
@@ -140,6 +142,7 @@ Interrupts / Tasks:
 
         let pwr = dp.PWR.constrain().freeze();
         let rcc = dp.RCC.constrain();
+        let mut syscfg = dp.SYSCFG.constrain();
         /* PLL Configured for 128MHz from 16MHz HSI */
         let mut pll_cfg = PllConfig::default();
         pll_cfg.m = PllMDiv::DIV_2;
@@ -189,9 +192,11 @@ Interrupts / Tasks:
         };
 
         // End-stops
+
         let mut endstop = gpioa.pa5.into_pull_up_input();
-        endstop.make_interrupt_source(syscfg);
-        endstop.enable_interrupt(exti);
+        endstop.make_interrupt_source(&mut syscfg);
+        endstop.enable_interrupt(&mut dp.EXTI);
+        endstop.trigger_on_edge(&mut dp.EXTI, stm32g4xx_hal::gpio::SignalEdge::Rising);
 
         // LED
         let mut led1 = gpiof.pf0.into_push_pull_output();
@@ -241,6 +246,7 @@ Interrupts / Tasks:
             cortex_m::peripheral::NVIC::unmask(hal::interrupt::TIM1_BRK_TIM15);
             cortex_m::peripheral::NVIC::unmask(hal::interrupt::ADC1_2);
             cortex_m::peripheral::NVIC::unmask(hal::interrupt::USB_LP);
+            cortex_m::peripheral::NVIC::unmask(hal::interrupt::EXTI9_5);
         }
 
         cmd_task::spawn().unwrap();
@@ -278,18 +284,20 @@ Interrupts / Tasks:
                 control.lock(|control| {
                     match Message::from_bytes(&bytes) {
                         Some(Message::SetSpeed(speed)) => {
-                            let speed = clamp(speed, -1000.0, 1000.0);
                             control.speed.set_target(speed);
                             info!("Set Speed {}", speed);
                         },
                         Some(Message::SetPosition(pos)) => {
-                            let pos = clamp(pos, -10000, 10000);
-                            control.position.set_target(pos);
+                            control.set_position(pos);
                             info!("Set Position {}", pos);
                         },
                         Some(Message::Enable(en)) => {
                             control.torque.enabled = en;
                             info!("Enable {}", en);
+                        },
+                        Some(Message::Home) => {
+                            control.start_homing();
+                            info!("Starting Homing...");
                         },
                         _ => {}
                     }
@@ -348,28 +356,18 @@ Interrupts / Tasks:
     }
 
 
-    #[task(binds = TIM1_BRK_TIM15, priority=4, local = [adc2, led1, telem_tx], shared = [control, usb_serial])]
+    #[task(binds = TIM1_BRK_TIM15, priority=4, local = [telem_tx], shared = [control, usb_serial])]
     fn timer_interrupt(mut ctx: timer_interrupt::Context) {
         controller::Speed::clear_timer();
-
-        let adc = ctx.local.adc2;
-        adc.start_conversion();
-
-        let led1 = ctx.local.led1;
-
-        //led2.set_low().unwrap();
-
         let tlm_tx = ctx.local.telem_tx;
         let mut ctrl = ctx.shared.control;
 
-        let potentiometer = adc::Adc2::sample_to_volts(adc.read_sample());
         ctrl.lock(|ctrl| {
             let now = Mono::now();
             let torque = ctrl.speed.control_cycle();
             ctrl.torque.set_target(torque);
 
-            let output = !ctrl.fault.is_fault_active();
-            led1.set_state(output.into());
+            let fault = !ctrl.fault.is_fault_active();
 
             let mut buffer = [0u8; 32];
 
@@ -397,15 +395,13 @@ Interrupts / Tasks:
                 buffer[5..9].copy_from_slice(&ctrl.position.last_out.output.to_be_bytes());
                 buffer[9..13].copy_from_slice(&ctrl.position.last_out.p.to_be_bytes());
                 buffer[13..17].copy_from_slice(&ctrl.position.last_out.i.to_be_bytes());
-                //buffer[17..21].copy_from_slice(&ctrl.position.last_out.d.to_be_bytes());
-                buffer[17..21].copy_from_slice(&ctrl.position.abs_pos.to_be_bytes());
+                buffer[17..21].copy_from_slice(&ctrl.position.last_out.d.to_be_bytes());
                 buffer[21..25].copy_from_slice(&ctrl.position.pid.setpoint.to_be_bytes());
                 buffer[25..29].copy_from_slice(&ctrl.speed.last_position.to_be_bytes());
                 buffer[29] = b'\n';
                 tlm_tx.try_send(buffer);
             }
 
-            ctrl.position.update_abs_position(potentiometer);
         });
     }
 
@@ -421,6 +417,30 @@ Interrupts / Tasks:
             motor.set_duty_cycle(duty_cycle);
         });
 
+    }
+
+    #[task(binds = EXTI9_5, priority=6, shared = [control], local = [led1])]
+    fn exti_interrupt(mut ctx: exti_interrupt::Context) {
+        let mut led1 = ctx.local.led1;
+        let mut ctrl = ctx.shared.control;
+
+        ctrl.lock(|ctrl| {
+            ctrl.endstop.clear_interrupt_pending_bit();
+
+            if ctrl.state == CtrlState::Homing {
+                let home = ctrl.set_home_position();
+                info!("Set Home position: {}", home);
+                ctrl.position.set_max_speed(1000.0);
+                ctrl.set_position(0);
+            } else {
+                ctrl.shutdown();
+
+                let pos = ctrl.speed.get_position();
+                warn!("Endstop Triggered: Pos {}", pos);
+            }
+        });
+
+        led1.toggle().unwrap();
     }
 
     #[task(binds=USB_LP, priority=3, local = [msg_tx, usb_dev], shared = [usb_serial])]
