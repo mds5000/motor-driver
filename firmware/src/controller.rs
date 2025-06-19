@@ -2,33 +2,35 @@ use defmt::warn;
 use embedded_hal::Qei;
 use embedded_hal::Direction;
 use pid::{ControlOutput, Pid};
+use rtic_monotonics::Monotonic;
 use stm32g4xx_hal::gpio::gpioa;
 use stm32g4xx_hal::gpio::Input;
 use stm32g4xx_hal::gpio::PullUp;
+use stm32g4xx_hal::pwm::FaultMonitor;
 use stm32g4xx_hal::{pwm};
 use stm32g4xx_hal::{gpio::{gpioa::{PA5, PA7}, gpiob::PB4, Alternate, AF2}, stm32::{RCC, TIM15, TIM2, TIM3, TIM8}};
 use micromath::F32Ext;
 use biquad::*;
 
+use crate::app::Mono;
 use crate::qei;
-
 type QeiEnc = qei::Qei<TIM3, PB4<Alternate<AF2>>, PA7<Alternate<AF2>>>;
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub enum CtrlState {
     Reset,
     Homing,
     Homed(i32),
-    Enabled,
+    Error,
 
 }
 
 pub struct Controller {
-    pub state: CtrlState,
+    state: CtrlState,
     pub torque: Torque,
     pub speed: Speed,
     pub position: Position,
-    pub fault: pwm::PwmControl<TIM8, pwm::FaultEnabled>,
+    fault: pwm::PwmControl<TIM8, pwm::FaultEnabled>,
     pub endstop: gpioa::PA5<Input<PullUp>>,
 }
 
@@ -44,15 +46,13 @@ impl Controller {
         }
     }
 
-    pub fn set_speed(&mut self, velocity: f32) {
-        let velocity = velocity.clamp(-1000.0, 1000.0);
-        self.speed.set_target(velocity);
-    }
+    pub fn set_position(&mut self, position: f32) {
+        const COUNTS_PER_DEGREE: f32 = 12500.0 / 90.0;
+        const ZERO_POSITION: i32 = 12500;
 
-    pub fn set_position(&mut self, position: i32) {
+        let pos = (position * COUNTS_PER_DEGREE).round() as i32;
         if let CtrlState::Homed(home_pos) = self.state {
-            let zero_position: i32 = 12500;
-            let pos = home_pos +  zero_position + position.clamp(-13000, 13000);
+            let pos = home_pos +  ZERO_POSITION + pos.clamp(-13000, 13000);
             self.position.set_target(pos);
         } else {
             warn!("Not homed.")
@@ -68,7 +68,7 @@ impl Controller {
         self.state = CtrlState::Homing;
         self.torque.enabled = true;
         self.position.set_max_speed(20.0);
-        self.position.set_target(-100000);
+        self.position.set_target(-25000);
     }
 
     pub fn set_home_position(&mut self) -> i32 {
@@ -80,16 +80,63 @@ impl Controller {
 
     pub fn shutdown(&mut self) {
         self.torque.enabled = false;
+        self.state = CtrlState::Error;
+    }
+
+    pub fn check_fault(&mut self) {
+        if self.fault.is_fault_active() {
+            self.state = CtrlState::Error
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.torque.enabled = false;
         self.state = CtrlState::Reset;
+    }
+
+    pub fn get_state(&self) -> CtrlState {
+        self.state
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.torque.enabled
+    }
+
+    pub fn generate_speed_telem(&self, buffer: &mut [u8]) {
+        let now = Mono::now();
+
+        buffer[0] = b'z';
+        buffer[1..5].copy_from_slice(&now.ticks().to_be_bytes());
+        buffer[5..9].copy_from_slice(&self.torque.current.to_be_bytes());
+        buffer[9..13].copy_from_slice(&self.speed.command_torque.to_be_bytes());
+        buffer[13..17].copy_from_slice(&self.speed.last_out.p.to_be_bytes());
+        buffer[17..21].copy_from_slice(&self.speed.last_out.i.to_be_bytes());
+        buffer[21..25].copy_from_slice(&self.speed.last_out.d.to_be_bytes());
+        buffer[25..29].copy_from_slice(&self.speed.rpm.to_be_bytes());
+        buffer[29] = b'\n';
+    }
+
+    pub fn generate_position_telem(&self, buffer: &mut [u8]) {
+        let now = Mono::now();
+
+        buffer[0] = b'p';
+        buffer[1..5].copy_from_slice(&now.ticks().to_be_bytes());
+        buffer[5..9].copy_from_slice(&self.position.last_out.output.to_be_bytes());
+        buffer[9..13].copy_from_slice(&self.position.last_out.p.to_be_bytes());
+        buffer[13..17].copy_from_slice(&self.position.last_out.i.to_be_bytes());
+        buffer[17..21].copy_from_slice(&self.position.last_out.d.to_be_bytes());
+        buffer[21..25].copy_from_slice(&self.position.pid.setpoint.to_be_bytes());
+        buffer[25..29].copy_from_slice(&self.speed.last_position.to_be_bytes());
+        buffer[29] = b'\n';
     }
 
 }
 
 pub struct Torque {
-    pub pid: Pid<f32>,
-    pub current: f32,
-    pub duty_cycle: f32,
-    pub enabled: bool,
+    pid: Pid<f32>,
+    current: f32,
+    duty_cycle: f32,
+    enabled: bool,
 }
 
 // Torque Controller Settings
@@ -261,7 +308,6 @@ impl Speed {
 
 
 pub struct Position {
-    pub cycle: u32,
     pub last_out: ControlOutput<f32>,
     pub pid: Pid<f32>,
 }
@@ -273,7 +319,6 @@ impl Position {
         pid.i(0.010, 10.0);
 
         Position {
-            cycle: 0,
             last_out: ControlOutput{p: 0.0, i: 0.0, d: 0.0, output: 0.0},
             pid,
         }

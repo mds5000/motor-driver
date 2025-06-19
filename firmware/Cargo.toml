@@ -27,8 +27,8 @@ micromath = "2.1.0"
 biquad = "0.4.2"
 
 [dependencies.stm32g4xx-hal]
-git = "https://github.com/umi-eng/stm32g4xx-hal.git"
-branch = "feature/usb"
+git = "https://github.com/stm32-rs/stm32g4xx-hal.git"
+branch = "main"
 features = ["stm32g431", "rt", "usb"]
 
 [profile.dev]

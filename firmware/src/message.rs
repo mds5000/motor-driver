@@ -2,7 +2,7 @@
 
 pub enum Message {
     SetSpeed(f32),
-    SetPosition(i32),
+    SetPosition(f32),
     SetPID(u8, f32, f32, f32),
     Enable(bool),
     Home,
@@ -31,7 +31,7 @@ impl Message {
             }
             b'p' => {
                 let pos = if let Ok(num) = bytes[1..5].try_into() {
-                    i32::from_be_bytes(num)
+                    f32::from_be_bytes(num)
                 } else {
                     return None
                 };

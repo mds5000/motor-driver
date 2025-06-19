@@ -1,4 +1,5 @@
 use core::u16;
+use core::marker::PhantomData;
 
 use embedded_hal;
 use stm32g4xx_hal;
@@ -7,14 +8,14 @@ use stm32g4xx_hal::stm32::{RCC, TIM3};
 
 pub struct Qei<TIM, PINA, PINB> {
     tim: TIM,
-    pin_a: PINA,
-    pin_b: PINB,
+    pin_a: PhantomData<PINA>,
+    pin_b: PhantomData<PINB>,
 }
 
 unsafe impl<TIM, PINA, PINB> Send for Qei<TIM, PINA, PINB> {}
 
 impl<TIM: Instance, PINA, PINB> Qei<TIM, PINA, PINB> {
-    pub fn new(mut tim: TIM, pin_a: PINA, pin_b: PINB) -> Self {
+    pub fn new(mut tim: TIM, _pin_a: PINA, _pin_b: PINB) -> Self {
         unsafe {
             let rcc_ptr = &(*RCC::ptr());
             TIM::enable(rcc_ptr);
@@ -23,7 +24,7 @@ impl<TIM: Instance, PINA, PINB> Qei<TIM, PINA, PINB> {
 
         tim.setup_qei();
 
-        Qei{ tim, pin_a, pin_b}
+        Qei{ tim, pin_a: PhantomData, pin_b: PhantomData }
     }
 }
 
